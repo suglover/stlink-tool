@@ -59,6 +59,7 @@ struct STLinkInfos {
   uint8_t jtag_version;
   uint8_t swim_version;
   uint16_t loader_version;
+  uint16_t product_id;
 };
 
 struct DFUStatus {
@@ -78,7 +79,7 @@ int stlink_dfu_download(libusb_device_handle *dev_handle,
 			size_t data_len,
 			uint16_t wBlockNum,
 			struct STLinkInfos *stlink_infos);
-int stlink_erase(libusb_device_handle *dev_handle,
+int stlink_erase_pages(libusb_device_handle *dev_handle,
 		 uint32_t address);
 int stlink_set_address(libusb_device_handle *dev_handle,
 		       uint32_t address);

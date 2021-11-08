@@ -33,7 +33,7 @@
 #include "stlink.h"
 
 #define EP_IN 1 | LIBUSB_ENDPOINT_IN
-#define EP_OUT 2 | LIBUSB_ENDPOINT_OUT
+#define EP_OUT 1 | LIBUSB_ENDPOINT_OUT
 
 #define USB_TIMEOUT 5000
 
@@ -48,7 +48,8 @@
 
 #define GET_COMMAND 0x00
 #define SET_ADDRESS_POINTER_COMMAND 0x21
-#define ERASE_COMMAND 0x41
+#define ERASE_PAGES_COMMAND 0x41
+#define ERASE_SECTORS_COMMAND 0x42
 #define READ_UNPROTECT_COMMAND 0x92
 
 int stlink_read_infos(libusb_device_handle *dev_handle,
@@ -86,9 +87,48 @@ int stlink_read_infos(libusb_device_handle *dev_handle,
   }
 
   infos->stlink_version = data[0] >> 4;
-  infos->jtag_version = (data[0] & 0x0F) << 2 | (data[1] & 0xC0) >> 6;
-  infos->swim_version = data[1] & 0x3F;
-  infos->loader_version = data[5] << 8 | data[4];
+
+  if (infos->stlink_version < 3) {
+    infos->jtag_version = (data[0] & 0x0F) << 2 | (data[1] & 0xC0) >> 6;
+    infos->swim_version = data[1] & 0x3F;
+    infos->loader_version = data[5] << 8 | data[4];
+    infos->product_id = 0;
+  } else {
+    infos->product_id = data[3] << 8 | data[2];
+
+    memset(data, 0, sizeof(data));
+
+    data[0] = 0xFB;
+    data[1] = 0x80;
+
+    /* Write */
+    res = libusb_bulk_transfer(dev_handle,
+            EP_OUT,
+            data,
+            16,
+            &rw_bytes,
+            USB_TIMEOUT);
+    if (res) {
+      fprintf(stderr, "USB transfer failure\n");
+      return -1;
+    }
+
+    /* Read */
+    res = libusb_bulk_transfer(dev_handle,
+            EP_IN,
+            data,
+            12,
+            &rw_bytes,
+            USB_TIMEOUT);
+    if (res) {
+      fprintf(stderr, "USB transfer failure\n");
+      return -1;
+    }
+
+    infos->jtag_version = data[2];
+    infos->swim_version = data[1];
+    infos->loader_version = data[11] << 8 | data[10];
+  }
 
   memset(data, 0, sizeof(data));
 
@@ -124,7 +164,12 @@ int stlink_read_infos(libusb_device_handle *dev_handle,
   /* Firmware encryption key generation */
   memcpy(infos->firmware_key, data, 4);
   memcpy(infos->firmware_key+4, data+8, 12);
-  my_encrypt((unsigned char*)"I am key, wawawa", infos->firmware_key, 16);
+
+  if (infos->stlink_version < 3) {
+    my_encrypt((unsigned char*)"I am key, wawawa", infos->firmware_key, 16);
+  } else {
+    my_encrypt((unsigned char*)" found...STlink ", infos->firmware_key, 16);
+  }
 
   return 0;
 }
@@ -186,6 +231,10 @@ int stlink_dfu_download(libusb_device_handle *dev_handle,
   int rw_bytes, res;
 
   memset(download_request, 0, sizeof(download_request));
+
+  if (wBlockNum >= 2 && stlink_infos->stlink_version == 3) {
+    my_encrypt((uint8_t*)" .ST-Link.ver.3.", data, data_len);
+  }
 
   download_request[0] = 0xF3;
   download_request[1] = DFU_DNLOAD;
@@ -294,36 +343,81 @@ int stlink_dfu_status(libusb_device_handle *dev_handle,
   return 0;
 }
 
-int stlink_erase(libusb_device_handle *dev_handle,
-			 uint32_t address) {
-  unsigned char erase_command[5];
+int stlink_erase_pages(libusb_device_handle *dev_handle, uint32_t address) {
+  unsigned char command[5];
   int res;
 
-  erase_command[0] = ERASE_COMMAND;
-  erase_command[1] = address & 0xFF;
-  erase_command[2] = (address >> 8) & 0xFF;
-  erase_command[3] = (address >> 16) & 0xFF;
-  erase_command[4] = (address >> 24) & 0xFF;
+  command[0] = ERASE_PAGES_COMMAND;
+  command[1] = address & 0xFF;
+  command[2] = (address >> 8) & 0xFF;
+  command[3] = (address >> 16) & 0xFF;
+  command[4] = (address >> 24) & 0xFF;
 
-  res = stlink_dfu_download(dev_handle, erase_command,
-			    sizeof(erase_command), 0, NULL);
-  
+  res = stlink_dfu_download(dev_handle, command, sizeof(command), 0, NULL);
+
   return res;
 }
 
-int stlink_set_address(libusb_device_handle *dev_handle,
-		       uint32_t address) {
-  unsigned char set_address_command[5];
+int address2sector(struct STLinkInfos *stlink_infos, uint32_t address) {
+  uint32_t sector_size, offset;
+
+  sector_size = (stlink_infos->product_id != 0x449) ? 0x4000 : 0x8000;
+  if (address < 0x08000000 || address >= (0x08000000 + 32*sector_size)) {
+    fprintf(stderr, "Invalid sector address\n");
+    return -1;
+  }
+
+  offset = address - 0x08000000;
+  if (offset < 4 * sector_size) {
+    // sectors 0..3
+    return offset / sector_size;
+
+  } else if (offset < 8 * sector_size) {
+    // sector 4
+    return 4;
+
+  } else {
+    // sectors 5+
+    return (offset / (8 * sector_size)) + 4;
+  }
+}
+
+int stlink_erase_sectors(libusb_device_handle *dev_handle, struct STLinkInfos *stlink_infos, uint32_t address, uint32_t size) {
+  unsigned char command[5];
+  int res;
+  int sector, sector_start, sector_end;
+
+  sector_start = address2sector(stlink_infos, address);
+  sector_end = address2sector(stlink_infos, address + size - 1);
+  if (sector_start < 0 || sector_end < 0 || sector_end < sector_start) {
+    return -1;
+  }
+
+  for (sector = sector_start; sector <= sector_end; sector++) {
+    command[0] = ERASE_SECTORS_COMMAND;
+    command[1] = sector & 0xFF;
+    command[2] = 0;
+    command[3] = 0;
+    command[4] = 0;
+
+    res = stlink_dfu_download(dev_handle, command, sizeof(command), 0, NULL);
+    if (res != 0) return res;
+  }
+
+  return 0;
+}
+
+int stlink_set_address(libusb_device_handle *dev_handle, uint32_t address) {
+  unsigned char command[5];
   int res;
 
-  set_address_command[0] = SET_ADDRESS_POINTER_COMMAND;
-  set_address_command[1] = address & 0xFF;
-  set_address_command[2] = (address >> 8) & 0xFF;
-  set_address_command[3] = (address >> 16) & 0xFF;
-  set_address_command[4] = (address >> 24) & 0xFF;
+  command[0] = SET_ADDRESS_POINTER_COMMAND;
+  command[1] = address & 0xFF;
+  command[2] = (address >> 8) & 0xFF;
+  command[3] = (address >> 16) & 0xFF;
+  command[4] = (address >> 24) & 0xFF;
 
-  res = stlink_dfu_download(dev_handle, set_address_command,
-			    sizeof(set_address_command), 0, NULL);
+  res = stlink_dfu_download(dev_handle, command, sizeof(command), 0, NULL);
   return res;
 }
 
@@ -357,6 +451,15 @@ int stlink_flash(libusb_device_handle *dev_handle,
 
   flashed_bytes = 0;
 
+  if (stlink_infos->stlink_version == 3) {
+    printf("Erasing...\n");
+    res = stlink_erase_sectors(dev_handle, stlink_infos, base_offset, file_size);
+    if (res) {
+      fprintf(stderr, "Erase error\n");
+      return res;
+    }
+  }
+
   while (flashed_bytes < file_size) {
     if ((flashed_bytes+chunk_size) > file_size) {
       cur_chunk_size = file_size - flashed_bytes;
@@ -364,15 +467,17 @@ int stlink_flash(libusb_device_handle *dev_handle,
       cur_chunk_size = chunk_size;
     }
 
-    res = stlink_erase(dev_handle, base_offset+flashed_bytes);
-    if (res) {
-      fprintf(stderr, "Erase error\n");
-      return res;
+    if (stlink_infos->stlink_version < 3) {
+      res = stlink_erase_pages(dev_handle, base_offset+flashed_bytes);
+      if (res) {
+        fprintf(stderr, "Erase error\n");
+        return res;
+      }
     }
     
     res = stlink_set_address(dev_handle, base_offset+flashed_bytes);
     if (res) {
-      fprintf(stderr, "Erase error\n");
+      fprintf(stderr, "SetAddress error\n");
       return res;
     }
 
@@ -380,7 +485,7 @@ int stlink_flash(libusb_device_handle *dev_handle,
     memset(firmware_chunk+cur_chunk_size, 0xff, chunk_size-cur_chunk_size);
     res = stlink_dfu_download(dev_handle, firmware_chunk, chunk_size, 2, stlink_infos);
     if (res) {
-      fprintf(stderr, "Erase error\n");
+      fprintf(stderr, "Download error\n");
       return res;
     }
 

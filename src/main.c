@@ -27,7 +27,7 @@
 #include "stlink.h"
 
 #define STLINK_VID 0x0483
-#define STLINK_PID 0x3748
+#define STLINK_PID 0x374d
 
 void print_help(char *argv[]) {
   printf("Usage: %s [options] [firmware.bin]\n", argv[0]);
@@ -103,7 +103,7 @@ int main(int argc, char *argv[]) {
   }
   printf("Current mode : %d\n", res);
 
-  if (res != 1) {
+  if (res != 3) {
     printf("ST-Link dongle is not in the correct mode. Please unplug and plug the dongle again.\n");
     libusb_release_interface(dev_handle, 0);
     return EXIT_SUCCESS;
@@ -111,7 +111,7 @@ int main(int argc, char *argv[]) {
 
   if (!probe) {
     if (do_load) {
-      stlink_flash(dev_handle, argv[optind], 0x8004000, 1024, &infos);
+      stlink_flash(dev_handle, argv[optind], 0x8020000, 1024, &infos);
     }
     stlink_exit_dfu(dev_handle);
   }
